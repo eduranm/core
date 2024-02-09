@@ -1,6 +1,8 @@
+import logging
 import re
 import sys
 from datetime import datetime
+from urllib.parse import urlparse
 
 from django.db.models import Q
 
@@ -35,6 +37,7 @@ from reference.models import JournalTitle
 from vocabulary.models import Vocabulary
 
 from .am_data_extraction import (
+    get_issns,
     extract_issn_print_electronic,
     extract_value,
     extract_value_from_journal_history,
@@ -119,9 +122,15 @@ def update_panel_interoperation(
     journal, indexed_at, secs_code, medline_code, medline_short_title, user
 ):
     get_or_create_indexed_at(journal, indexed_at=indexed_at, user=user)
-    
+
     update_title_in_database(user=user, journal=journal, code=secs_code, acronym="secs")
-    update_title_in_database(user=user, journal=journal, code=medline_code, acronym="medline", title=medline_short_title)
+    update_title_in_database(
+        user=user,
+        journal=journal,
+        code=medline_code,
+        acronym="medline",
+        title=medline_short_title,
+    )
 
 
 def update_panel_information(
@@ -179,7 +188,7 @@ def update_panel_institution(
     """
     Ex eletronic_addrees:
         [{"_": "maritzal@telcel.net.ve"}, {"_": " fbengoanutricion@cantv.net"}]
-        [{"_": "info@asppr.net"}] 
+        [{"_": "info@asppr.net"}]
         [{"_": "CLEIejEditor@fing.edu.uy"}]
     """
     location = create_or_update_location(
@@ -193,18 +202,18 @@ def update_panel_institution(
     electronic_address = extract_value(electronic_address)
     if isinstance(electronic_address, str):
         electronic_address = [electronic_address]
-
-    for item in electronic_address:
-        try:
-            item = item and item.strip().lower()
-            JournalEmail.objects.get(journal=journal, email=item)
-        except JournalEmail.DoesNotExist:
-            JournalEmail.objects.create(journal=journal, email=item)
+    if electronic_address:
+        for item in electronic_address:
+            try:
+                item = item and item.strip().lower()
+                JournalEmail.objects.get(journal=journal, email=item)
+            except JournalEmail.DoesNotExist:
+                JournalEmail.objects.create(journal=journal, email=item)
 
     publisher = extract_value(publisher)
 
     if isinstance(publisher, str):
-        publisher = re.split(r'\s*[-\/,]\s*', publisher)
+        publisher = re.split(r"\s*[-\/,]\s*", publisher)
 
     if publisher:
         for p in publisher:
@@ -269,7 +278,10 @@ def update_panel_website(
         license = License.create_or_update(license_type=license_type, user=user)
         journal.use_license = license
     url_of_the_main_collection = extract_value(url_of_the_main_collection)
-    assign_journal_to_main_collection(journal=journal, url_of_the_main_collection=url_of_the_main_collection)
+    assign_journal_to_main_collection(
+        journal=journal, url_of_the_main_collection=url_of_the_main_collection
+    )
+
 
 def update_panel_notes(
     journal,
@@ -300,13 +312,27 @@ def update_panel_notes(
         if isinstance(notes, str):
             notes = [notes]
         n = "\n".join(notes)
-        obj = Annotation.create_or_update(
-            journal=journal,
-            notes=n,
-            creation_date=creation_date,
-            update_date=update_date,
-            user=user,
-        )
+        try:
+            obj = Annotation.create_or_update(
+                journal=journal,
+                notes=n,
+                creation_date=creation_date,
+                update_date=update_date,
+                user=user,
+            )
+        except Exception as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            UnexpectedEvent.create(
+                exception=e,
+                exc_traceback=exc_traceback,
+                detail={
+                    "function": "journal.sources.article_meta.update_panel_notes",
+                    "journal_id": journal.id,
+                    "notes": n,
+                    "creation_date": f"{creation_date}",
+                    "update_date": f"{update_date}",
+                },
+            )
 
 
 def update_panel_legacy_compatibility_fields(
@@ -321,17 +347,48 @@ def update_panel_legacy_compatibility_fields(
     is_supplement,
     acronym_letters,
 ):
-    user_subs = extract_value(user_subscription)
-    if user_subs and 2 <= len(user_subs) <= 3:
-        journal.user_subscription = user_subs
     journal.center_code = extract_value(center_code)
     journal.identification_number = extract_value(identification_number)
-    journal.ftp = extract_value(ftp)
     journal.subtitle = extract_value(subtitle)
     journal.section = extract_value(section)
     journal.has_supplement = extract_value(has_supplement)
     journal.is_supplement = extract_value(is_supplement)
     journal.acronym_letters = extract_value(acronym_letters)
+    set_ftp(journal, extract_value(ftp))
+    set_user_subscription(journal, extract_value(user_subscription))
+
+
+def set_ftp(journal, ftp):
+    accept_ftp_strings = ("art", "na", "iss")
+    if ftp and ftp.lower() in accept_ftp_strings:
+        journal.ftp = ftp
+
+
+def set_user_subscription(journal, user_subs):
+    accept_user_subscription_string = ("sub", "reg", "na")
+    if user_subs and user_subs.lower() in accept_user_subscription_string:
+        journal.user_subscription = user_subs
+
+
+def get_issns_from_scielo_journal(issn_scielo, title, issn_print, issn_electronic):
+    if bool(issn_print) ^ bool(issn_electronic):
+        # caso um dos ISSN esteja ausente, tenta recuperar o ISSN ausente de
+        # um OfficialJournal anteriormente cadastrado se aplicável (#573)
+        try:
+            sj = SciELOJournal.objects.get(
+                journal__title=title,
+                issn_scielo=issn_scielo,
+            )
+            official_journal = sj.journal.official
+            issn_print = issn_print or official_journal.issn_print
+            issn_electronic = issn_electronic or official_journal.issn_electronic
+        except (
+            SciELOJournal.DoesNotExist,
+            SciELOJournal.MultipleObjectsReturned,
+            AttributeError,
+        ):
+            pass
+    return issn_print, issn_electronic
 
 
 def create_or_update_official_journal(
@@ -357,17 +414,21 @@ def create_or_update_official_journal(
         [{"_": "ONLIN"}]
     Ex current_issn:
         [{"_": "1676-5648"}]
+    Ex old_title:
+        Ex 1: [{'_': 'Pesquisa Agropecuária Brasileira. Série Agronômica'}, {'_': 'Pesquisa Agropecuária Brasileira. Série Veterinária'}, {'_': 'Pesquisa Agropecuária Brasileira. Série Zootecnia'}]
+        Ex 2: [{'_': 'Informe Epidemiológico do SUS'}]
     """
     title = extract_value(title)
     issn_scielo = extract_value(issn_scielo)
 
-    if type_issn and current_issn:
-        for item in type_issn:
-            item["t"] = item.pop("_")
-        type_issn[0].update(current_issn[0])
-    issn = issn_print_or_electronic or type_issn
-    issn_print, issn_electronic = extract_issn_print_electronic(
-        issn_print_or_electronic=issn
+    issn_print, issn_electronic = get_issns(
+        issn_print_or_electronic,
+        issn_scielo,
+        type_issn,
+        current_issn,
+    )
+    issn_print, issn_electronic = get_issns_from_scielo_journal(
+        issn_scielo, title, issn_print, issn_electronic
     )
 
     official_journal = OfficialJournal.create_or_update(
@@ -376,7 +437,9 @@ def create_or_update_official_journal(
         issn_electronic=issn_electronic,
         issnl=None,
         title=title,
+        issn_print_is_active=bool(issn_print),
     )
+
     get_or_update_parallel_titles(
         of_journal=official_journal, parallel_titles=parallel_titles
     )
@@ -384,6 +447,8 @@ def create_or_update_official_journal(
         official_journal.add_new_title(user, extract_value(new_title))
         official_journal.add_old_title(user, extract_value(old_title))
     official_journal.iso_short_title = extract_value(iso_short_title)
+    official_journal.previous_journal_titles = extract_value(old_title)
+    official_journal.next_journal_title = extract_value(new_title)
 
     initial_date = extract_value(initial_date)
     terminate_date = extract_value(terminate_date)
@@ -448,7 +513,7 @@ def get_or_create_sponsor(sponsor, journal, user):
     """
     sponsor = extract_value(sponsor)
     if isinstance(sponsor, str):
-        sponsor = re.split(r'\s*[-\/,]\s*', sponsor)
+        sponsor = re.split(r"\s*[-\/,]\s*", sponsor)
     if sponsor:
         for s in sponsor:
             ## FIXME
@@ -497,11 +562,24 @@ def get_or_create_subject_descriptor(subject_descriptors, journal, user):
             if s:
                 for word in re.split(",|;", s):
                     word = word.strip()
-                    obj, created = SubjectDescriptor.objects.get_or_create(
-                        value=word,
-                        creator=user,
-                    )
-                    data.append(obj)
+                    try:
+                        obj = SubjectDescriptor.get_or_create(
+                            value=word,
+                            user=user,
+                        )
+                        if obj:
+                            data.append(obj)
+                    except Exception as e:
+                        exc_type, exc_value, exc_traceback = sys.exc_info()
+                        UnexpectedEvent.create(
+                            exception=e,
+                            exc_traceback=exc_traceback,
+                            detail={
+                                "function": "journal.sources.am_to_core.get_or_create_subject_descriptor",
+                                "journal_id": journal.id,
+                                "subject": s,
+                            },
+                        )
         journal.subject_descriptor.set(data)
 
 
@@ -512,7 +590,9 @@ def create_or_update_subject(subject, journal, user):
         if isinstance(sub, str):
             sub = [sub]
         for s in sub:
-            obj = Subject.get(code=s,)
+            obj = Subject.get(
+                code=s,
+            )
             data.append(obj)
         journal.subject.set(data)
 
@@ -604,23 +684,30 @@ def get_or_create_indexed_at(journal, indexed_at, user):
         [{'_': 'Index to Dental Literature'}, {'_': 'LILACS'}, {'_': 'Base de Dados BBO'}, {'_': "Ulrich's"}, {'_': 'Biological Abstracts'}, {'_': 'Medline'}]
     """
     data_index = []
-    data_additional_indexed= []
+    data_additional_indexed = []
     if indexed_at:
         indexed = extract_value(indexed_at)
         if isinstance(indexed, str):
             indexed = [indexed]
         for i in indexed:
             try:
-                obj_index = IndexedAt.objects.get(Q(name__iexact=i) | Q(acronym__iexact=i))
+                obj_index = IndexedAt.objects.get(
+                    Q(name__iexact=i) | Q(acronym__iexact=i)
+                )
                 data_index.append(obj_index)
             except IndexedAt.DoesNotExist:
-                obj_additional_index, created = AdditionalIndexedAt.objects.get_or_create(
-                    name=i,
-                    creator=user,
-                )
+                try:
+                    obj_additional_index = AdditionalIndexedAt.get_or_create(
+                        name=i,
+                        user=user,
+                    )
+                except Exception as e:
+                    # Nao registra error caso valor de i seja None
+                    continue
                 data_additional_indexed.append(obj_additional_index)
         journal.indexed_at.set(data_index)
         journal.additional_indexed_at.set(data_additional_indexed)
+
 
 def create_or_update_location(
     journal,
@@ -640,31 +727,28 @@ def create_or_update_location(
         [{'_': 'Rua Felizardo, 750 Jardim Botânico'}, {'_': 'CEP: 90690-200'}, {'_': 'RS - Porto Alegre'}, {'_': '(51) 3308 5814'}]
     """
 
-    #O valor publisher_country pode fornecer tanto 
-    #o nome completo do país quanto o acrônimo do país.
-    country_value = extract_value(publisher_country)
-    country = None
-    for item in Country.standardize(country_value, user=user):
-        country = item.get("country")
+    country = standardize_location(extract_value(publisher_city), Country, user=user)
+    city = standardize_location(extract_value(publisher_city), City, user=user)
+    state = standardize_location(extract_value(publisher_state), State, user=user)
 
-    name_city = extract_value(publisher_city)
-    city = None
-    for item in City.standardize(name_city, user=user):
-        city = item.get("city")
-
-    #O valor publisher_state pode fornecer tanto 
-    #o nome completo do estado quanto o acrônimo do estado.
-    state_value = extract_value(publisher_state)
-    state = None
-    for item in State.standardize(state_value, user=user):
-        state = item.get("state")
-
-    location = Location.create_or_update(
-        user=user,
-        country=country,
-        state=state,
-        city=city,
-    )
+    try:
+        location = Location.create_or_update(
+            user=user,
+            country=country,
+            state=state,
+            city=city,
+        )
+    except Exception as e:
+        location = None
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        UnexpectedEvent.create(
+            exception=e,
+            exc_traceback=exc_traceback,
+            detail={
+                "function": "journal.sources.article_meta.create_or_update_location",
+                "journal_id": journal.id,
+            },
+        )
     journal.contact_location = location
 
     address = extract_value(address)
@@ -676,6 +760,15 @@ def create_or_update_location(
     journal.contact_address = address
 
     return location
+
+
+def standardize_location(value_location, ObjectLocation, user):
+    standardized_value = None
+    for item in ObjectLocation.standardize(value_location, user):
+        standardized_value = next(iter(item.values()))
+        if standardized_value:
+            break
+    return standardized_value
 
 
 def get_or_update_parallel_titles(of_journal, parallel_titles):
@@ -718,25 +811,38 @@ def get_or_create_copyright_holder(journal, copyright_holder_name, user):
 
     if copyright_holder_name:
         for cp in copyright_holder_name:
-            copyright_holder = CopyrightHolder.get_or_create(
-                name=cp,
-                acronym=None,
-                level_1=None,
-                level_2=None,
-                level_3=None,
-                user=user,
-                location=None,
-                official=None,
-                is_official=None,
-                url=None,
-                institution_type=None,
-            )
-            copyright_holder_history = CopyrightHolderHistory.get_or_create(
-                institution=copyright_holder,
-                user=user,
-            )
-            copyright_holder_history.journal = journal
-            copyright_holder_history.save()
+            try:
+                copyright_holder = CopyrightHolder.get_or_create(
+                    name=cp,
+                    acronym=None,
+                    level_1=None,
+                    level_2=None,
+                    level_3=None,
+                    user=user,
+                    location=None,
+                    official=None,
+                    is_official=None,
+                    url=None,
+                    institution_type=None,
+                )
+                copyright_holder_history = CopyrightHolderHistory.get_or_create(
+                    institution=copyright_holder,
+                    user=user,
+                )
+                copyright_holder_history.journal = journal
+                copyright_holder_history.save()
+            except Exception as e:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                UnexpectedEvent.create(
+                    exception=e,
+                    exc_traceback=exc_traceback,
+                    detail={
+                        "function": "journal.sources.am_to_core.get_or_create_copyright_holder",
+                        "journal_id": journal.id,
+                        "copyright_holder_name": copyright_holder_name,
+                    },
+                )
+
 
 def update_title_in_database(user, journal, code, acronym, title=None):
     code = extract_value(code)
@@ -744,17 +850,40 @@ def update_title_in_database(user, journal, code, acronym, title=None):
     if not title:
         title = journal.title
     else:
-        title = extract_value(title)    
-    create_or_update_title_in_database(user=user, journal=journal, indexed_at=indexed_at, identifier=code, title=title)
+        title = extract_value(title)
+    create_or_update_title_in_database(
+        user=user, journal=journal, indexed_at=indexed_at, identifier=code, title=title
+    )
+
 
 def create_or_update_title_in_database(user, journal, indexed_at, title, identifier):
-    TitleInDatabase.create_or_update(user=user, journal=journal, indexed_at=indexed_at, title=title, identifier=identifier)
+    TitleInDatabase.create_or_update(
+        user=user,
+        journal=journal,
+        indexed_at=indexed_at,
+        title=title,
+        identifier=identifier,
+    )
+
 
 def assign_journal_to_main_collection(journal, url_of_the_main_collection):
     if url_of_the_main_collection:
         try:
-            cleaned_domain_query = url_of_the_main_collection.replace("http://", "").replace("https://", "") 
-            collection = Collection.objects.get(domain=cleaned_domain_query)
+            url_parse = urlparse(url_of_the_main_collection)
+            if not url_parse.scheme:
+                url_parse_scheme = "https://" + url_of_the_main_collection
+                url_parse = urlparse(url_parse_scheme)
+            collection = Collection.objects.get(domain__icontains=url_parse.hostname)
             journal.main_collection = collection
-        except (Collection.DoesNotExist, ValueError):
-            raise MainCollectionNotFoundError()
+        except Exception as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            UnexpectedEvent.create(
+                exception=e,
+                exc_traceback=exc_traceback,
+                detail={
+                    "function": "journal.sources.am_to_core.assign_jo urnal_to_main_collection",
+                    "journal_id": journal.id,
+                    "url_of_the_main_collection": url_of_the_main_collection,
+                    "cleaned_domain_query": url_parse,
+                },
+            )

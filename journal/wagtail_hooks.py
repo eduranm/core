@@ -13,6 +13,9 @@ from . import models
 from .button_helper import IndexedAtHelper
 from .views import import_file, validate
 
+COLLECTION_TEAM = "Collection Team"
+JOURNAL_TEAM = "Journal Team"
+
 
 class OfficialJournalCreateView(CreateView):
     def form_valid(self, form):
@@ -35,12 +38,12 @@ class OfficialJournalAdmin(ModelAdmin):
         "initial_year",
         "terminate_year",
         "issn_print",
+        "issn_print_is_active",
         "issn_electronic",
-        "issnl",
         "created",
         "updated",
     )
-    list_filter = ("terminate_year", "initial_year",)
+    list_filter = ("issn_print_is_active", "terminate_year", "initial_year", )
     search_fields = (
         "title",
         "initial_year",
@@ -70,10 +73,12 @@ class JournalAdmin(ModelAdmin):
     list_display = (
         "title",
         "contact_location",
+        "valid",
         "created",
         "updated",
     )
     list_filter = (
+        "valid",
         "use_license",
         "publishing_model",
         "subject",
@@ -85,7 +90,15 @@ class JournalAdmin(ModelAdmin):
         "official__issn_electronic",
         "contact_location__country__name",
     )
-
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        user_groups = request.user.groups.values_list('name', flat=True)
+        if COLLECTION_TEAM in user_groups:
+            return qs.filter(scielojournal__collection__in=request.user.collection.all())
+        elif JOURNAL_TEAM in user_groups:
+            return qs.filter(id__in=request.user.journal.all().values_list("id", flat=True))
+        return qs
+    
 
 class SciELOJournalCreateView(CreateView):
     def form_valid(self, form):
@@ -118,6 +131,14 @@ class SciELOJournalAdmin(ModelAdmin):
         "journal__title",
         "issn_scielo",
     )
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        user_groups = request.user.groups.values_list('name', flat=True)
+        if COLLECTION_TEAM in user_groups:
+            return qs.filter(collection__in=request.user.collection.all())
+        elif JOURNAL_TEAM in user_groups:
+            return qs.filter(id__in=request.user.journal.all().values_list("id", flat=True))
+        return qs
 
 
 class JournalAdminGroup(ModelAdminGroup):

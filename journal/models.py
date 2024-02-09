@@ -74,7 +74,8 @@ class OfficialJournal(CommonControlField, ClusterableModel):
         related_name="new_title_journal",
     )
     old_title = models.ManyToManyField("self", blank=True)
-
+    previous_journal_titles = models.TextField(_("Previous Journal titles"),null=True, blank=True)
+    next_journal_title = models.TextField(_("Next Journal Title"), null=True, blank=True)
     initial_year = models.CharField(
         _("Initial Year"), max_length=4, blank=True, null=True
     )
@@ -103,6 +104,7 @@ class OfficialJournal(CommonControlField, ClusterableModel):
     issn_electronic = models.CharField(
         _("ISSN Eletronic"), max_length=9, null=True, blank=True
     )
+    issn_print_is_active = models.BooleanField(verbose_name=_("ISSN Print is active"), default=False)
     issnl = models.CharField(_("ISSNL"), max_length=9, null=True, blank=True)
 
     panels_titles = [
@@ -110,7 +112,9 @@ class OfficialJournal(CommonControlField, ClusterableModel):
         FieldPanel("iso_short_title"),
         InlinePanel("parallel_title", label=_("Parallel titles")),
         AutocompletePanel("old_title"),
-        FieldPanel("new_title"),
+        AutocompletePanel("new_title"),
+        FieldPanel("previous_journal_titles"),
+        FieldPanel("next_journal_title"),
     ]
 
     panels_dates = [
@@ -126,6 +130,7 @@ class OfficialJournal(CommonControlField, ClusterableModel):
 
     panels_issns = [
         FieldPanel("issn_print"),
+        FieldPanel("issn_print_is_active"),
         FieldPanel("issn_electronic"),
         FieldPanel("issnl"),
     ]
@@ -218,6 +223,7 @@ class OfficialJournal(CommonControlField, ClusterableModel):
         issn_electronic=None,
         issnl=None,
         title=None,
+        issn_print_is_active=None,
     ):
         try:
             obj = cls.get(
@@ -236,6 +242,7 @@ class OfficialJournal(CommonControlField, ClusterableModel):
         obj.issn_electronic = issn_electronic or obj.issn_electronic
         obj.issn_print = issn_print or obj.issn_print
         obj.title = title or obj.title
+        obj.issn_print_is_active = issn_print_is_active or obj.issn_print_is_active
         obj.save()
 
         return obj
@@ -270,8 +277,8 @@ class OfficialJournal(CommonControlField, ClusterableModel):
 
 
 class SocialNetwork(models.Model):
-    name = models.TextField(
-        _("Name"), choices=choices.SOCIAL_NETWORK_NAMES, null=True, blank=True
+    name = models.CharField(
+        _("Name"), choices=choices.SOCIAL_NETWORK_NAMES, max_length=20, null=True, blank=True
     )
     url = models.URLField(_("URL"), null=True, blank=True)
 
@@ -499,7 +506,7 @@ class Journal(CommonControlField, ClusterableModel):
     )
     ftp = models.CharField(
         _("Ftp"),
-        max_length=50,
+        max_length=3,
         blank=True,
         null=True,
     )
@@ -560,6 +567,7 @@ class Journal(CommonControlField, ClusterableModel):
         blank=True,
         verbose_name=_("DigitalPreservationAgency"),
     )
+    valid = models.BooleanField(default=False, null=True, blank=True)
 
     autocomplete_search_field = "title"
 
@@ -600,7 +608,7 @@ class Journal(CommonControlField, ClusterableModel):
     panels_website = [
         FieldPanel("contact_name"),
         FieldPanel("contact_address"),
-        FieldPanel("contact_location"),
+        AutocompletePanel("contact_location"),
         InlinePanel("journal_email", label=_("Contact e-mail")),
         FieldPanel("logo", heading=_("Logo")),
         FieldPanel("journal_url"),
@@ -801,6 +809,14 @@ class Journal(CommonControlField, ClusterableModel):
                 ]
             ),
         ]
+
+    def is_indexed_at(self, db_acronym):
+        if not db_acronym:
+            raise ValueError("Journal.is_indexed_at requires db_acronym")
+        try:
+            return bool(self.indexed_at.get(acronym=db_acronym))
+        except IndexedAt.DoesNotExist:
+            return False
 
     @property
     def data(self):
@@ -1650,7 +1666,7 @@ class SciELOJournal(CommonControlField, ClusterableModel, SocialNetwork):
         FieldPanel("issn_scielo"),
         FieldPanel("status"),
         AutocompletePanel("collection"),
-        InlinePanel("journal_history"),
+        InlinePanel("journal_history", label=_("Journal History"), classname="collapsed"),
     ]
 
     @classmethod
@@ -1739,7 +1755,7 @@ class JournalParallelTitle(TextWithLang):
 
 
 class SubjectDescriptor(CommonControlField):
-    value = models.CharField(max_length=255, null=True, blank=True)
+    value = models.CharField(max_length=255, null=True, blank=True, unique=True)
 
     autocomplete_search_field = "value"
 
@@ -1752,6 +1768,45 @@ class SubjectDescriptor(CommonControlField):
     class Meta:
         ordering = ["value"]
 
+    @classmethod
+    def get(
+        cls,
+        value,
+        ):
+        if not value:
+            return None
+        try:
+            return cls.objects.get(value=value)
+        except cls.MultipleObjectsReturned:
+            return cls.objects.filter(value=value).first()
+
+    @classmethod
+    def create(
+        cls,
+        value,
+        user,
+    ):
+        try:
+            obj = cls(
+                value=value,
+                creator=user
+            )
+            obj.save()
+            return obj
+        except IntegrityError:
+            return cls.get(value=value)
+
+    @classmethod
+    def get_or_create(
+        cls,
+        value,
+        user,
+        ):
+        try:
+            return cls.get(value=value)
+        except cls.DoesNotExist:
+            return cls.create(value=value, user=user)
+        
 
 class Subject(CommonControlField):
     code = models.CharField(max_length=30, null=True, blank=True)
@@ -2032,7 +2087,42 @@ class IndexedAtFile(models.Model):
 
 
 class AdditionalIndexedAt(CommonControlField):
-    name = models.TextField(_("Name"), null=False, blank=False)
+    name = models.TextField(_("Name"), null=True, blank=True)
+
+    @classmethod
+    def get(
+        cls,
+        name
+        ):
+        if name:
+            try:
+                return cls.objects.get(name=name)
+            except cls.MultipleObjectsReturned:
+                return cls.objects.filter(name=name).first()
+        raise ValueError("AdditionalIndexedAt.get requires name paramenter")
+
+    @classmethod
+    def create(
+        cls,
+        name,
+        user,
+    ):
+        obj = cls()
+        obj.name = name
+        obj.creator = user
+        obj.save()
+        return obj
+        
+    @classmethod
+    def get_or_create(
+        cls,
+        name,
+        user,
+    ):
+        try:
+            return cls.get(name=name)
+        except cls.DoesNotExist:
+            return cls.create(name=name, user=user)
 
     autocomplete_search_field = "name"
 
